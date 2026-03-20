@@ -1,0 +1,120 @@
+# ============================================
+# docker-compose.yml — Download Monitor Stack
+# ============================================
+# Usage: docker-compose up -d
+# Dashboard: http://localhost:3000
+# API: http://localhost:8000/docs
+
+version: "3.8"
+
+services:
+  # ── PostgreSQL ──
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: download_monitor
+      POSTGRES_USER: dlmon
+      POSTGRES_PASSWORD: dlmon_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # ── Redis (Celery broker) ──
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  # ── FastAPI Backend ──
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://dlmon:dlmon_secret@postgres/download_monitor
+      REDIS_URL: redis://redis:6379/0
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      DASHBOARD_URL: http://localhost:3000
+      S3_BUCKET: ${S3_BUCKET:-download-monitor-screenshots}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+    depends_on:
+      - postgres
+      - redis
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ── Celery Worker (task dispatcher) ──
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://dlmon:dlmon_secret@postgres/download_monitor
+      REDIS_URL: redis://redis:6379/0
+      S3_BUCKET: ${S3_BUCKET:-download-monitor-screenshots}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+    depends_on:
+      - postgres
+      - redis
+    command: celery -A tasks worker --loglevel=info --concurrency=4
+
+  # ── React Frontend ──
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+
+# ============================================
+# requirements.txt — Backend Python deps
+# ============================================
+# Save this as backend/requirements.txt
+#
+# fastapi==0.115.*
+# uvicorn[standard]==0.34.*
+# sqlalchemy==2.0.*
+# psycopg2-binary==2.9.*
+# celery[redis]==5.4.*
+# redis==5.2.*
+# pydantic==2.10.*
+# boto3==1.35.*
+# playwright==1.49.*
+# Pillow==11.*
+# pytesseract==0.3.*
+# pyautogui==0.9.*
+# requests==2.32.*
+# python-multipart==0.0.18
+
+# ============================================
+# backend/Dockerfile
+# ============================================
+# FROM python:3.12-slim
+# WORKDIR /app
+# COPY requirements.txt .
+# RUN pip install --no-cache-dir -r requirements.txt
+# RUN playwright install chromium firefox && playwright install-deps
+# COPY . .
+# CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# ============================================
+# .env (create in project root)
+# ============================================
+# SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+# S3_BUCKET=download-monitor-screenshots
+# AWS_ACCESS_KEY_ID=your-key
+# AWS_SECRET_ACCESS_KEY=your-secret
+# AWS_DEFAULT_REGION=us-east-1
