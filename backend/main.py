@@ -29,6 +29,7 @@ SCREENSHOT_DIR.mkdir(exist_ok=True)
 # ── Config ── SQLite for dev, swap to postgres in prod
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./download_monitor.db")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:5173")
 
 engine = create_engine(
     DATABASE_URL,
@@ -297,13 +298,34 @@ def _send_slack_notification(run_id: str, db: Session):
         "timeout": ":hourglass:",
     }
 
-    lines = [f'{emoji.get(str(o.value), "?")} *{str(o.value).replace("_"," ").title()}*: {c}' for o, c in rows]
+    lines = [f'{emoji.get(str(o), "?")} *{str(o).replace("_"," ").title()}*: {c}' for o, c in rows]
+
+    # Count pass/fail
+    pass_count = sum(c for o, c in rows if str(o) in ("success_executed",))
+    warn_count = sum(c for o, c in rows if str(o) in ("success_smartscreen", "browser_warned_dangerous", "browser_warned_uncommon"))
+    fail_count = sum(c for o, c in rows if str(o) in ("browser_blocked", "defender_blocked", "download_failed", "timeout"))
+
+    # Color the header based on results
+    if fail_count > 0:
+        header_emoji = ":red_circle:"
+    elif warn_count > 0:
+        header_emoji = ":large_yellow_circle:"
+    else:
+        header_emoji = ":large_green_circle:"
+
+    run_name = run.name or f"Run #{run_id[:8]}"
 
     payload = {
         "blocks": [
-            {"type": "header", "text": {"type": "plain_text", "text": f"Download Test Complete — {run.name or run_id[:8]}"}},
+            {"type": "header", "text": {"type": "plain_text", "text": f"{header_emoji} Download Sentinel — {run_name}"}},
             {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Total*: {run.total_tasks} tasks"}},
+            {"type": "section", "fields": [
+                {"type": "mrkdwn", "text": f"*Total tasks:* {run.total_tasks}"},
+                {"type": "mrkdwn", "text": f"*Pass:* {pass_count} | *Warn:* {warn_count} | *Fail:* {fail_count}"},
+            ]},
+            {"type": "actions", "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "View Dashboard"}, "url": f"{DASHBOARD_URL}"}
+            ]},
         ]
     }
 
@@ -451,6 +473,38 @@ def add_screenshot(task_id: str, data: ScreenshotAdd, db: Session = Depends(get_
     db.add(ss)
     db.commit()
     return {"status": "added", "screenshot_id": str(ss.id)}
+
+
+# ── Settings endpoint ──
+@app.get("/api/settings")
+def get_settings():
+    return {
+        "slack_webhook_configured": bool(SLACK_WEBHOOK),
+        "dashboard_url": DASHBOARD_URL,
+    }
+
+@app.post("/api/settings/slack")
+def set_slack_webhook(data: dict):
+    global SLACK_WEBHOOK
+    SLACK_WEBHOOK = data.get("webhook_url", "")
+    return {"status": "updated", "configured": bool(SLACK_WEBHOOK)}
+
+@app.post("/api/settings/slack/test")
+def test_slack():
+    if not SLACK_WEBHOOK:
+        raise HTTPException(400, "Slack webhook not configured")
+    import requests as req
+    payload = {
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": "Download Sentinel — Test Notification"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": ":white_check_mark: Slack integration is working!"}},
+        ]
+    }
+    try:
+        resp = req.post(SLACK_WEBHOOK, json=payload, timeout=10)
+        return {"status": resp.status_code, "ok": resp.status_code == 200}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 # ── List screenshots for a task (from disk) ──

@@ -39,6 +39,98 @@ function ProgressBar({ completed, total }) {
   );
 }
 
+// ── Settings Dialog ──
+function SettingsDialog({ onClose }) {
+  const [webhook, setWebhook] = useState("");
+  const [testResult, setTestResult] = useState(null);
+  const [newBrand, setNewBrand] = useState("");
+  const [brands, setBrands] = useState([]);
+
+  useEffect(() => {
+    fetch(`${API}/brands`).then(r => r.json()).then(setBrands);
+    fetch(`${API}/settings`).then(r => r.json()).then(data => {
+      if (data.slack_webhook_configured) setWebhook("••••••••••");
+    });
+  }, []);
+
+  const saveWebhook = async () => {
+    await fetch(`${API}/settings/slack`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ webhook_url: webhook }),
+    });
+    setTestResult("Saved!");
+  };
+
+  const testSlack = async () => {
+    setTestResult("Sending...");
+    const res = await fetch(`${API}/settings/slack/test`, { method: "POST" });
+    const data = await res.json();
+    setTestResult(data.ok ? "Sent! Check Slack." : `Error: ${data.detail || "failed"}`);
+  };
+
+  const addBrand = async () => {
+    if (!newBrand.trim()) return;
+    const slug = newBrand.trim().toLowerCase().replace(/\s+/g, "-");
+    await fetch(`${API}/brands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: newBrand.trim(), slug }),
+    });
+    setNewBrand("");
+    const updated = await fetch(`${API}/brands`).then(r => r.json());
+    setBrands(updated);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-lg p-6 space-y-6">
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold">Settings</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl">&times;</button>
+        </div>
+
+        <div className="space-y-3">
+          <h3 className="text-sm font-medium text-gray-700">Slack webhook</h3>
+          <div className="flex gap-2">
+            <input
+              className="flex-1 border rounded-lg px-3 py-2 text-sm font-mono"
+              placeholder="https://hooks.slack.com/services/..."
+              value={webhook}
+              onChange={(e) => setWebhook(e.target.value)}
+            />
+            <button onClick={saveWebhook} className="px-3 py-2 bg-blue-600 text-white rounded-lg text-sm">Save</button>
+          </div>
+          <div className="flex items-center gap-3">
+            <button onClick={testSlack} className="text-sm text-blue-600 hover:text-blue-800">Send test message</button>
+            {testResult && <span className="text-sm text-gray-500">{testResult}</span>}
+          </div>
+        </div>
+
+        <div className="border-t pt-4 space-y-3">
+          <h3 className="text-sm font-medium text-gray-700">Brands</h3>
+          <div className="flex gap-2">
+            <input
+              className="flex-1 border rounded-lg px-3 py-2 text-sm"
+              placeholder="Brand name (e.g. PDFriend)"
+              value={newBrand}
+              onChange={(e) => setNewBrand(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addBrand()}
+            />
+            <button onClick={addBrand} className="px-3 py-2 bg-gray-800 text-white rounded-lg text-sm">Add</button>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {brands.map(b => (
+              <span key={b.id} className="px-3 py-1 bg-gray-100 rounded-full text-sm text-gray-700">{b.name}</span>
+            ))}
+            {brands.length === 0 && <span className="text-sm text-gray-400">No brands yet</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── New Run Dialog ──
 function NewRunDialog({ onClose, onSubmit, brands }) {
   const [urls, setUrls] = useState("");
@@ -181,9 +273,19 @@ function RunDetail({ run, onBack }) {
   const [selectedTask, setSelectedTask] = useState(null);
   const [filter, setFilter] = useState("all");
 
-  useEffect(() => {
+  const loadDetail = useCallback(() => {
     fetch(`${API}/runs/${run.id}`).then((r) => r.json()).then(setDetail);
   }, [run.id]);
+
+  useEffect(() => {
+    loadDetail();
+    // Auto-refresh while running, stop when completed
+    const timer = setInterval(() => {
+      if (detail && detail.status === "completed") return;
+      loadDetail();
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [loadDetail, detail?.status]);
 
   if (!detail) return <div className="p-8 text-center text-gray-400">Loading...</div>;
 
@@ -267,6 +369,7 @@ export default function Dashboard() {
   const [brands, setBrands] = useState([]);
   const [selectedRun, setSelectedRun] = useState(null);
   const [showNewRun, setShowNewRun] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [brandFilter, setBrandFilter] = useState("");
   const wsRef = useRef(null);
 
@@ -284,15 +387,33 @@ export default function Dashboard() {
 
   // WebSocket for live updates
   useEffect(() => {
-    const ws = new WebSocket("ws://localhost:8000/ws");
-    ws.onmessage = (e) => {
-      const data = JSON.parse(e.data);
-      if (data.type === "run_created" || data.type === "task_update") {
-        loadRuns();
-      }
+    let ws;
+    let reconnectTimer;
+
+    const connect = () => {
+      ws = new WebSocket("ws://localhost:8000/ws");
+      ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        if (data.type === "run_created" || data.type === "task_update") {
+          loadRuns();
+        }
+      };
+      ws.onclose = () => {
+        reconnectTimer = setTimeout(connect, 3000);
+      };
+      wsRef.current = ws;
     };
-    wsRef.current = ws;
-    return () => ws.close();
+
+    connect();
+
+    // Also poll every 5 seconds as fallback
+    const pollTimer = setInterval(loadRuns, 5000);
+
+    return () => {
+      clearInterval(pollTimer);
+      clearTimeout(reconnectTimer);
+      if (ws) ws.close();
+    };
   }, [loadRuns]);
 
   const createRun = async (data) => {
@@ -320,10 +441,16 @@ export default function Dashboard() {
           <h1 className="text-2xl font-bold text-gray-900">Download monitor</h1>
           <p className="text-sm text-gray-500 mt-1">Track file download outcomes across browsers</p>
         </div>
-        <button
-          onClick={() => setShowNewRun(true)}
-          className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition"
-        >New run</button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setShowSettings(true)}
+            className="px-4 py-2 border rounded-lg text-sm font-medium text-gray-600 hover:text-gray-800 transition"
+          >Settings</button>
+          <button
+            onClick={() => setShowNewRun(true)}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition"
+          >New run</button>
+        </div>
       </div>
 
       <div className="flex items-center gap-3">
@@ -380,6 +507,7 @@ export default function Dashboard() {
       </div>
 
       {showNewRun && <NewRunDialog onClose={() => setShowNewRun(false)} onSubmit={createRun} brands={brands} />}
+      {showSettings && <SettingsDialog onClose={() => { setShowSettings(false); loadRuns(); fetch(`${API}/brands`).then(r => r.json()).then(setBrands); }} />}
     </div>
   );
 }

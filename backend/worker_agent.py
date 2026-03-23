@@ -427,26 +427,27 @@ class CLIDownloader:
                     f.write(f'timeout /t 8 >nul\n')
                 cmd = ["cmd", "/c", batch_path]
             else:  # powershell
-                ps_cmd = (
-                    f"Write-Host '==============================' -ForegroundColor Yellow; "
-                    f"Write-Host 'Downloading: {filename}' -ForegroundColor Cyan; "
-                    f"Write-Host 'URL: {url}' -ForegroundColor Cyan; "
-                    f"Write-Host '==============================' -ForegroundColor Yellow; "
-                    f"Write-Host ''; "
-                    f"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
-                    f"$ProgressPreference='Continue'; "
-                    f"try {{ "
-                    f"  Invoke-WebRequest -Uri '{url}' -OutFile '{save_path}' -UseBasicParsing -SkipCertificateCheck; "
-                    f"  Write-Host ''; "
-                    f"  Write-Host 'Download COMPLETE!' -ForegroundColor Green; "
-                    f"  Write-Host 'Saved to: {save_path}' -ForegroundColor Green "
-                    f"}} catch {{ "
-                    f"  Write-Host \"FAILED: $($_.Exception.Message)\" -ForegroundColor Red "
-                    f"}}; "
-                    f"Write-Host ''; "
-                    f"Start-Sleep -Seconds 8"
-                )
-                cmd = ["powershell", "-NoProfile", "-Command", ps_cmd]
+                # Write a PS1 script to avoid escaping issues
+                ps1_path = str(self.dl_dir / "download.ps1")
+                with open(ps1_path, "w") as f:
+                    f.write("Write-Host '==============================' -ForegroundColor Yellow\n")
+                    f.write(f"Write-Host 'Downloading: {filename}' -ForegroundColor Cyan\n")
+                    f.write(f"Write-Host 'URL: {url}' -ForegroundColor Cyan\n")
+                    f.write("Write-Host '==============================' -ForegroundColor Yellow\n")
+                    f.write("Write-Host ''\n")
+                    f.write("[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12\n")
+                    f.write("$ProgressPreference = 'Continue'\n")
+                    f.write("try {\n")
+                    f.write(f"  Invoke-WebRequest -Uri '{url}' -OutFile '{save_path}' -UseBasicParsing\n")
+                    f.write("  Write-Host ''\n")
+                    f.write("  Write-Host 'Download COMPLETE!' -ForegroundColor Green\n")
+                    f.write(f"  Write-Host 'Saved to: {save_path}' -ForegroundColor Green\n")
+                    f.write("} catch {\n")
+                    f.write('  Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red\n')
+                    f.write("}\n")
+                    f.write("Write-Host ''\n")
+                    f.write("Start-Sleep -Seconds 8\n")
+                cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1_path]
 
             # Launch in a VISIBLE console window
             proc = subprocess.Popen(
