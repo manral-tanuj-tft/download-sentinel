@@ -55,15 +55,16 @@ def capture_active_window(save_path: str):
 
 
 def capture_window_by_pid(save_path: str, pid: int):
-    """Capture a specific window by its process ID."""
+    """Capture a specific window by its process ID — works even if window is behind others."""
     try:
         import ctypes
         from ctypes import wintypes
-        import pyautogui
+        from PIL import Image
+        import io
 
         user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
 
-        # Callback to find window belonging to PID
         EnumWindowsProc = ctypes.WINFUNCTYPE(
             ctypes.c_bool, wintypes.HWND, wintypes.LPARAM
         )
@@ -76,31 +77,35 @@ def capture_window_by_pid(save_path: str, pid: int):
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
             if proc_id.value == pid and user32.IsWindowVisible(hwnd):
                 target_hwnd = hwnd
-                return False  # stop enumerating
+                return False
             return True
 
         user32.EnumWindows(EnumWindowsProc(enum_callback), 0)
 
         if target_hwnd:
-            # Bring window to front first
-            user32.SetForegroundWindow(target_hwnd)
+            # Force window to front
+            SW_RESTORE = 9
+            user32.ShowWindow(target_hwnd, SW_RESTORE)
+            ctypes.windll.user32.SetForegroundWindow(target_hwnd)
             import time
-            time.sleep(0.3)
+            time.sleep(0.5)
 
+            # Get window rect
             rect = wintypes.RECT()
             user32.GetWindowRect(target_hwnd, ctypes.byref(rect))
-
             left = max(rect.left, 0)
             top = max(rect.top, 0)
-            width = rect.right - rect.left
-            height = rect.bottom - rect.top
+            right = rect.right
+            bottom = rect.bottom
+            w = right - left
+            h = bottom - top
 
-            if width > 50 and height > 50:
-                img = pyautogui.screenshot(region=(left, top, width, height))
+            if w > 50 and h > 50:
+                from PIL import ImageGrab
+                img = ImageGrab.grab(bbox=(left, top, right, bottom))
                 img.save(save_path)
                 return
 
-        # Fallback to foreground window
         capture_active_window(save_path)
     except Exception:
         try:
@@ -459,7 +464,7 @@ class CLIDownloader:
             time.sleep(1)
             self._cli_screenshot("01_started", proc.pid)
 
-            # Wait for download, capture one mid-download screenshot
+            # Wait for download, keep capturing until process ends
             elapsed = 0
             captured_mid = False
             while proc.poll() is None and elapsed < 90:
@@ -468,6 +473,9 @@ class CLIDownloader:
                 if not captured_mid and elapsed >= 4:
                     self._cli_screenshot("02_progress", proc.pid)
                     captured_mid = True
+                # Always overwrite 03_completed while window is still alive
+                if captured_mid and proc.poll() is None:
+                    self._cli_screenshot("03_completed", proc.pid)
 
             if elapsed >= 90 and proc.poll() is None:
                 proc.kill()
@@ -490,8 +498,6 @@ class CLIDownloader:
                 else:
                     self.result.error_details = f"{self.method}: file is empty (0 bytes, exit code {proc.returncode})"
                 return self.result.to_dict()
-
-            self._cli_screenshot("02_downloaded")
 
             # Wait and check if Defender removes it
             time.sleep(3)
