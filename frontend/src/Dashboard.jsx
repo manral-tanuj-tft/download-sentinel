@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = window.location.origin;
 const API = `${API_BASE}/api`;
 
 const OUTCOME_CONFIG = {
@@ -391,7 +391,8 @@ export default function Dashboard() {
     let reconnectTimer;
 
     const connect = () => {
-      ws = new WebSocket("ws://localhost:8000/ws");
+      const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
       ws.onmessage = (e) => {
         const data = JSON.parse(e.data);
         if (data.type === "run_created" || data.type === "task_update") {

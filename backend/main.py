@@ -15,6 +15,7 @@ from sqlalchemy import create_engine, select, func, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pathlib import Path
 
 from models import (
@@ -25,6 +26,9 @@ from models import (
 # Create screenshots dir
 SCREENSHOT_DIR = Path(__file__).parent / "screenshots"
 SCREENSHOT_DIR.mkdir(exist_ok=True)
+
+# Frontend build directory
+FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
 
 # ── Config ── SQLite for dev, swap to postgres in prod
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./download_monitor.db")
@@ -544,3 +548,16 @@ async def ws_global(ws: WebSocket):
             await ws.receive_text()
     except WebSocketDisconnect:
         mgr.disconnect(ws, "__global__")
+
+
+# ── Serve Frontend (must be LAST) ──
+if FRONTEND_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR / "assets")), name="frontend-assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        # Serve index.html for all non-API routes (SPA routing)
+        file_path = FRONTEND_DIR / full_path
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(str(file_path))
+        return FileResponse(str(FRONTEND_DIR / "index.html"))
