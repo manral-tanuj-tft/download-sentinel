@@ -26,4 +26,9 @@ frontend/dist/
 
 # OS
 .DS_Store
-Thumbs.db
+Thumbs.db*.db
+*.db-shm
+*.db-wal
+
+# Misc
+findstr
