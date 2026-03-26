@@ -5,3 +5,8 @@ pydantic
 requests
 python-multipart
 aiofiles
+apscheduler>=3.10.4
+httpx
+# Azure SDK (optional — only needed for real snapshot restore)
+azure-identity
+azure-mgmt-compute
