@@ -285,9 +285,10 @@ class RunDispatcher:
 # ── Job Scheduler ─────────────────────────────────────────────────────
 
 class JobScheduler:
-    def __init__(self, SessionLocal, dispatcher: RunDispatcher):
+    def __init__(self, SessionLocal, dispatcher: RunDispatcher, local_runner=None):
         self.SessionLocal = SessionLocal
         self.dispatcher = dispatcher
+        self.local_runner = local_runner  # fn(run_id) — fallback when no VMs
 
     def load_all(self):
         db = self.SessionLocal()
@@ -337,7 +338,8 @@ class JobScheduler:
             j = db.get(ScheduledJob, job.id)
             if j:
                 ap_job = _scheduler.get_job(apid)
-                j.next_run_at = ap_job.next_run_time if ap_job else None
+                next_run = getattr(ap_job, "next_fire_time", None) or getattr(ap_job, "next_run_time", None)
+                j.next_run_at = next_run
                 db.commit()
         finally:
             db.close()
@@ -383,7 +385,8 @@ class JobScheduler:
             job.run_count += 1
 
             ap_job = _scheduler.get_job(f"job_{job.id}")
-            job.next_run_at = ap_job.next_run_time if ap_job else None
+            if ap_job:
+                job.next_run_at = getattr(ap_job, "next_fire_time", None) or getattr(ap_job, "next_run_time", None)
 
             db.commit()
             run_id = str(run.id)
@@ -398,22 +401,21 @@ class JobScheduler:
         # Check if VMs are configured — if not, run locally
         db2 = self.SessionLocal()
         try:
-            from sqlalchemy import func as sqlfunc
             vm_count = db2.query(VMPool).count()
         finally:
             db2.close()
 
         if vm_count > 0:
             asyncio.create_task(self.dispatcher.dispatch(run_id))
-        else:
-            # No VMs — run locally in a background thread
+        elif self.local_runner:
             import threading
-            from main import _execute_run_local
             threading.Thread(
-                target=_execute_run_local,
+                target=self.local_runner,
                 args=(run_id,),
                 daemon=True,
             ).start()
+        else:
+            logger.warning(f"No VMs and no local_runner configured for job {job_id}")
 
     def create(self, job: ScheduledJob):
         self._register(job)
@@ -458,12 +460,12 @@ dispatcher:    Optional[RunDispatcher] = None
 job_scheduler: Optional[JobScheduler] = None
 
 
-def init(SessionLocal, ws_broadcast_fn=None):
+def init(SessionLocal, ws_broadcast_fn=None, local_runner=None):
     global vm_manager, dispatcher, job_scheduler
 
     vm_manager    = VMManager(SessionLocal)
     dispatcher    = RunDispatcher(SessionLocal, vm_manager, ws_broadcast_fn)
-    job_scheduler = JobScheduler(SessionLocal, dispatcher)
+    job_scheduler = JobScheduler(SessionLocal, dispatcher, local_runner=local_runner)
 
     job_scheduler.load_all()
     _scheduler.start()

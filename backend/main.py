@@ -97,7 +97,7 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
 
     import scheduler as sched
-    sched.init(SessionLocal, ws_broadcast_fn=mgr.broadcast)
+    sched.init(SessionLocal, ws_broadcast_fn=mgr.broadcast, local_runner=_execute_run_local)
 
     yield
 
@@ -550,6 +550,22 @@ def _execute_run_local(run_id: str):
         _append_history(db, run, "completed", "All tasks finished")
         db.commit()
 
+        # Sync to MongoDB (best effort)
+        try:
+            import mongo_reporter
+            run_dict = _run_to_dict(run, db)
+            tasks_list = db.execute(
+                select(DownloadTask).where(DownloadTask.test_run_id == run_id)
+            ).scalars().all()
+            tasks_dicts = [
+                {"url": t.url, "browser": t.browser, "outcome": t.outcome,
+                 "browser_message": t.browser_message, "error_details": t.error_details}
+                for t in tasks_list
+            ]
+            mongo_reporter.sync_run(run_dict, tasks_dicts)
+        except Exception:
+            pass
+
         if SLACK_WEBHOOK:
             _send_slack_notification(run_id, db)
 
@@ -743,6 +759,151 @@ def list_task_screenshots(task_id: str):
 
 
 # ── Settings ──────────────────────────────────────────────────────────
+
+# ── CSV Export ────────────────────────────────────────────────────────
+
+@app.get("/api/runs/{run_id}/export")
+def export_run_csv(run_id: str, db: Session = Depends(get_db)):
+    """Download a CSV of all tasks in a run."""
+    import csv, io
+    from fastapi.responses import StreamingResponse
+
+    run = db.get(TestRun, run_id)
+    if not run:
+        raise HTTPException(404, "Run not found")
+
+    tasks = db.execute(
+        select(DownloadTask).where(DownloadTask.test_run_id == run_id)
+        .order_by(DownloadTask.url, DownloadTask.browser)
+    ).scalars().all()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "url", "browser", "outcome", "file_name",
+        "http_status", "browser_message", "defender_message",
+        "error_details", "started_at", "finished_at"
+    ])
+    for t in tasks:
+        writer.writerow([
+            t.url, t.browser, t.outcome, t.file_name or "",
+            t.http_status or "", t.browser_message or "",
+            t.defender_message or "", t.error_details or "",
+            t.started_at.isoformat() if t.started_at else "",
+            t.finished_at.isoformat() if t.finished_at else "",
+        ])
+
+    buf.seek(0)
+    run_name = (run.name or run_id[:8]).replace(" ", "_")
+    filename = f"sentinel_{run_name}_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+# ── Retry failed tasks ────────────────────────────────────────────────
+
+@app.post("/api/runs/{run_id}/retry")
+async def retry_failed_tasks(run_id: str, db: Session = Depends(get_db)):
+    """Re-queue all failed/timeout tasks in a run."""
+    run = db.get(TestRun, run_id)
+    if not run:
+        raise HTTPException(404, "Run not found")
+
+    failed_outcomes = {
+        DownloadOutcome.DOWNLOAD_FAILED.value,
+        DownloadOutcome.TIMEOUT.value,
+    }
+
+    failed_tasks = db.execute(
+        select(DownloadTask).where(
+            DownloadTask.test_run_id == run_id,
+            DownloadTask.outcome.in_(failed_outcomes)
+        )
+    ).scalars().all()
+
+    if not failed_tasks:
+        return {"status": "nothing_to_retry", "count": 0}
+
+    for task in failed_tasks:
+        task.outcome = DownloadOutcome.PENDING.value
+        task.started_at = None
+        task.finished_at = None
+        task.error_details = None
+        task.browser_message = None
+
+    run.status = TestRunStatus.RUNNING.value
+    run.completed_tasks = max(0, run.completed_tasks - len(failed_tasks))
+    _append_history(db, run, "running", f"Retrying {len(failed_tasks)} failed tasks")
+    db.commit()
+
+    # Re-run locally
+    threading.Thread(
+        target=_execute_run_local,
+        args=(run_id,),
+        daemon=True,
+    ).start()
+
+    return {"status": "retrying", "count": len(failed_tasks)}
+
+
+# ── Analytics ─────────────────────────────────────────────────────────
+
+@app.get("/api/analytics")
+def get_analytics(
+    brand_id:  Optional[str] = Query(None),
+    days:      int           = Query(30),
+    db: Session = Depends(get_db),
+):
+    """Outcome breakdown + daily run counts for dashboard charts."""
+    from datetime import timedelta
+    from sqlalchemy import cast, Date
+
+    since = datetime.utcnow() - timedelta(days=days)
+
+    # Try MongoDB first
+    try:
+        import mongo_reporter
+        mongo_data = mongo_reporter.get_analytics(brand_id=brand_id, days=days)
+        if mongo_data:
+            return {"source": "mongodb", "outcomes": mongo_data}
+    except Exception:
+        pass
+
+    # Fall back to SQLite
+    q = select(DownloadTask.outcome, func.count()).where(
+        DownloadTask.test_run_id.in_(
+            select(TestRun.id).where(TestRun.created_at >= since)
+        )
+    )
+    if brand_id:
+        q = q.where(
+            DownloadTask.test_run_id.in_(
+                select(TestRun.id).where(TestRun.brand_id == brand_id)
+            )
+        )
+    q = q.group_by(DownloadTask.outcome)
+    outcome_rows = db.execute(q).all()
+
+    # Daily run counts
+    daily_q = select(
+        func.date(TestRun.created_at).label("day"),
+        func.count().label("count")
+    ).where(TestRun.created_at >= since)
+    if brand_id:
+        daily_q = daily_q.where(TestRun.brand_id == brand_id)
+    daily_q = daily_q.group_by(func.date(TestRun.created_at)).order_by("day")
+    daily_rows = db.execute(daily_q).all()
+
+    return {
+        "source": "sqlite",
+        "outcomes": {str(o): c for o, c in outcome_rows},
+        "daily_runs": [{"day": str(d), "count": c} for d, c in daily_rows],
+    }
+
 
 @app.get("/api/settings")
 def get_settings():
