@@ -5,10 +5,21 @@ Screenshots saved locally and served via FastAPI static route.
 """
 import os, time, subprocess, re, shutil, platform
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
+from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import uvicorn
+
 from models import DownloadOutcome
+
+# Pre-import playwright to avoid greenlet DLL error inside threads
+from playwright.sync_api import sync_playwright as _pw_sync
+
+# Base URL for screenshots — set AGENT_BASE_URL env var to ngrok URL
+AGENT_BASE_URL = os.getenv("AGENT_BASE_URL", "http://localhost:5000")
 
 # Screenshots stored here — served by FastAPI at /screenshots/
 SCREENSHOT_DIR = Path(__file__).parent / "screenshots"
@@ -38,7 +49,6 @@ _MACHINE_NAMES = {
 
 
 def get_pe_machine(path: str) -> Optional[int]:
-    """Return the PE Machine field (e.g. 0x8664) or None if unreadable."""
     try:
         with open(path, "rb") as f:
             if f.read(2) != b"MZ":
@@ -54,33 +64,24 @@ def get_pe_machine(path: str) -> Optional[int]:
 
 
 def is_runnable_on_host(path: str) -> tuple[bool, str]:
-    """
-    Returns (can_run, reason_string).
-    reason_string is empty when can_run is True.
-    """
     host = platform.machine()
     runnable = _HOST_RUNNABLE.get(host, {PE_MACHINE_I386, PE_MACHINE_AMD64})
     machine = get_pe_machine(path)
-
     if machine is None:
-        return True, ""  # Can't read PE header — let Windows decide
-
+        return True, ""
     if machine not in runnable:
         exe_arch = _MACHINE_NAMES.get(machine, f"0x{machine:04X}")
         return False, f"Architecture mismatch: file is {exe_arch}, host is {host}"
-
     return True, ""
 
 
 # ── Screenshot helpers ─────────────────────────────────────────────────
 
 def screenshot_url(task_id: str, filename: str) -> str:
-    """Return the URL path for a screenshot."""
-    return f"/screenshots/{task_id}/{filename}"
+    return f"{AGENT_BASE_URL}/screenshots/{task_id}/{filename}"
 
 
 def capture_active_window(save_path: str):
-    """Capture only the active/foreground window, not the full desktop."""
     try:
         import ctypes
         from ctypes import wintypes
@@ -88,10 +89,8 @@ def capture_active_window(save_path: str):
 
         user32 = ctypes.windll.user32
         hwnd = user32.GetForegroundWindow()
-
         rect = wintypes.RECT()
         user32.GetWindowRect(hwnd, ctypes.byref(rect))
-
         left = max(rect.left, 0)
         top = max(rect.top, 0)
         width = rect.right - rect.left
@@ -111,18 +110,13 @@ def capture_active_window(save_path: str):
 
 
 def capture_window_by_pid(save_path: str, pid: int):
-    """Capture a specific window by its process ID — works even if window is behind others."""
     try:
         import ctypes
         from ctypes import wintypes
         from PIL import ImageGrab
 
         user32 = ctypes.windll.user32
-
-        EnumWindowsProc = ctypes.WINFUNCTYPE(
-            ctypes.c_bool, wintypes.HWND, wintypes.LPARAM
-        )
-
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
         target_hwnd = None
 
         def enum_callback(hwnd, lparam):
@@ -137,21 +131,13 @@ def capture_window_by_pid(save_path: str, pid: int):
         user32.EnumWindows(EnumWindowsProc(enum_callback), 0)
 
         if target_hwnd:
-            SW_RESTORE = 9
-            user32.ShowWindow(target_hwnd, SW_RESTORE)
+            user32.ShowWindow(target_hwnd, 9)
             ctypes.windll.user32.SetForegroundWindow(target_hwnd)
             time.sleep(0.5)
-
             rect = wintypes.RECT()
             user32.GetWindowRect(target_hwnd, ctypes.byref(rect))
-            left  = max(rect.left, 0)
-            top   = max(rect.top, 0)
-            right = rect.right
-            bottom = rect.bottom
-            w = right - left
-            h = bottom - top
-
-            if w > 50 and h > 50:
+            left, top, right, bottom = max(rect.left,0), max(rect.top,0), rect.right, rect.bottom
+            if right-left > 50 and bottom-top > 50:
                 img = ImageGrab.grab(bbox=(left, top, right, bottom))
                 img.save(save_path)
                 return
@@ -185,7 +171,6 @@ BLOCK_PATTERNS = [
 
 
 def classify_from_text(text: str) -> Optional[DownloadOutcome]:
-    """Try to classify outcome from visible page/dialog text."""
     for pattern, outcome in BLOCK_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             return outcome
@@ -214,8 +199,6 @@ class DownloadResult:
 # ── Browser downloader ─────────────────────────────────────────────────
 
 class BrowserDownloader:
-    """Download a file via a real browser using Playwright."""
-
     CHANNEL_MAP = {
         "edge":    {"browser": "chromium", "channel": "msedge"},
         "chrome":  {"browser": "chromium", "channel": "chrome"},
@@ -232,7 +215,6 @@ class BrowserDownloader:
         self.dl_dir.mkdir(parents=True, exist_ok=True)
 
     def _capture(self, page, step: str) -> str:
-        """Capture the browser window only."""
         filename = f"{step}.png"
         path = str(self.ss_dir / filename)
         try:
@@ -244,7 +226,6 @@ class BrowserDownloader:
         return screenshot_url(self.task_id, filename)
 
     def _capture_desktop(self, step: str) -> str:
-        """Full desktop capture for SmartScreen/Defender overlays."""
         filename = f"{step}_desktop.png"
         path = str(self.ss_dir / filename)
         try:
@@ -257,11 +238,8 @@ class BrowserDownloader:
     def execute(self, url: str) -> dict:
         cfg = self.CHANNEL_MAP.get(self.browser_name, self.CHANNEL_MAP["chrome"])
 
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as p:
+        with _pw_sync() as p:
             launcher = getattr(p, cfg["browser"])
-
             try:
                 launch_args = {"headless": False}
                 if cfg["channel"]:
@@ -277,7 +255,6 @@ class BrowserDownloader:
 
             try:
                 self._capture(page, "01_before")
-
                 download = None
 
                 try:
@@ -285,14 +262,13 @@ class BrowserDownloader:
                         try:
                             page.goto(url, wait_until="commit", timeout=30000)
                         except Exception:
-                            pass  # Expected for direct download links
+                            pass
                     download = dl_info.value
                 except Exception as e:
                     error_msg = str(e)
                     self.result.error_details = error_msg
                     ss_url = self._capture(page, "02_no_download")
                     self.result.screenshot_url = ss_url
-
                     try:
                         page_text = page.inner_text("body", timeout=3000)
                         classified = classify_from_text(page_text)
@@ -304,25 +280,20 @@ class BrowserDownloader:
                             self.result.browser_message = error_msg[:500]
                     except Exception:
                         self.result.outcome = DownloadOutcome.DOWNLOAD_FAILED
-
                     browser.close()
                     return self.result.to_dict()
 
-                # Download triggered — capture multiple times
                 time.sleep(2)
                 self._capture(page, "02_download_bar")
                 time.sleep(3)
                 ss_url = self._capture(page, "03_downloading")
-
                 self.result.file_name = download.suggested_filename
 
-                # Check if download failed
                 failure = download.failure()
                 if failure:
                     self.result.error_details = failure
                     ss_url = self._capture(page, "04_download_failed")
                     self.result.screenshot_url = ss_url
-
                     try:
                         page_text = page.inner_text("body", timeout=3000)
                         classified = classify_from_text(page_text)
@@ -335,11 +306,9 @@ class BrowserDownloader:
                     except Exception:
                         self.result.outcome = DownloadOutcome.BROWSER_BLOCKED
                         self.result.browser_message = failure
-
                     browser.close()
                     return self.result.to_dict()
 
-                # Save file
                 save_path = str(self.dl_dir / download.suggested_filename)
                 try:
                     download.save_as(save_path)
@@ -352,7 +321,6 @@ class BrowserDownloader:
                 ss_url = self._capture(page, "04_downloaded")
                 self.result.screenshot_url = ss_url
 
-                # Post-download Defender check
                 file_path = Path(save_path)
                 for _ in range(5):
                     time.sleep(2)
@@ -367,7 +335,6 @@ class BrowserDownloader:
                         browser.close()
                         return self.result.to_dict()
 
-                # Try to execute (.exe / .msi)
                 if save_path.endswith((".exe", ".msi")):
                     time.sleep(2)
                     exec_outcome = self._try_execute(page, save_path)
@@ -384,7 +351,6 @@ class BrowserDownloader:
                     self._capture(page, "99_error")
                 except Exception:
                     pass
-
             finally:
                 try:
                     browser.close()
@@ -394,15 +360,12 @@ class BrowserDownloader:
         return self.result.to_dict()
 
     def _try_execute(self, page, exe_path: str) -> Optional[DownloadOutcome]:
-        """Run the downloaded file and check for SmartScreen/Defender."""
         try:
             fp = Path(exe_path)
-
             if not fp.exists() or fp.stat().st_size == 0:
                 self.result.defender_message = "File missing/empty before execution"
                 return DownloadOutcome.DEFENDER_BLOCKED
 
-            # Architecture guard — skip execution if PE arch doesn't match host
             can_run, reason = is_runnable_on_host(exe_path)
             if not can_run:
                 self.result.error_details = reason
@@ -426,11 +389,9 @@ class BrowserDownloader:
                 self.result.error_details = f"Execution check: {e}"
                 return None
 
-            # Wait for SmartScreen / Defender overlay
             time.sleep(6)
             self._capture_desktop("05_execution")
 
-            # OCR the desktop screenshot to detect SmartScreen/Defender text
             desktop_path = self.ss_dir / "05_execution_desktop.png"
             if desktop_path.exists():
                 try:
@@ -448,7 +409,6 @@ class BrowserDownloader:
                 except ImportError:
                     pass
 
-            # Check if Defender deleted the file post-launch
             time.sleep(2)
             if not fp.exists():
                 self.result.defender_message = "File removed by Windows Defender"
@@ -473,19 +433,17 @@ class BrowserDownloader:
 # ── CLI downloader ─────────────────────────────────────────────────────
 
 class CLIDownloader:
-    """Download via curl or PowerShell."""
-
     def __init__(self, method: str, task_id: str):
         self.method = method
         self.task_id = task_id
         self.result = DownloadResult()
-        self.dl_dir = DOWNLOAD_DIR / task_id
+        # Use C:\downloads to avoid spaces-in-path issues
+        self.dl_dir = Path("C:/downloads") / task_id
         self.dl_dir.mkdir(parents=True, exist_ok=True)
         self.ss_dir = SCREENSHOT_DIR / task_id
         self.ss_dir.mkdir(parents=True, exist_ok=True)
 
     def _cli_screenshot(self, step: str, pid: int = None) -> str:
-        """Capture the CLI window by its process ID."""
         filename = f"{step}.png"
         path = str(self.ss_dir / filename)
         if pid:
@@ -517,7 +475,7 @@ class CLIDownloader:
                     f.write(f')\n')
                     f.write(f'timeout /t 8 >nul\n')
                 cmd = ["cmd", "/c", batch_path]
-            else:  # powershell
+            else:
                 ps1_path = str(self.dl_dir / "download.ps1")
                 with open(ps1_path, "w") as f:
                     f.write("Write-Host '==============================' -ForegroundColor Yellow\n")
@@ -539,13 +497,8 @@ class CLIDownloader:
                     f.write("Start-Sleep -Seconds 8\n")
                 cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1_path]
 
-            # Launch in a VISIBLE console window
-            proc = subprocess.Popen(
-                cmd,
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-            )
+            proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
 
-            # Screenshots: started, progress, completed
             time.sleep(1)
             self._cli_screenshot("01_started", proc.pid)
 
@@ -568,19 +521,17 @@ class CLIDownloader:
 
             file_path = Path(save_path)
             self._cli_screenshot("03_completed", proc.pid)
-
             self.result.http_status = 200 if proc.returncode == 0 else 0
 
             if not file_path.exists() or file_path.stat().st_size == 0:
                 self.result.outcome = DownloadOutcome.DOWNLOAD_FAILED
                 self.result.error_details = (
-                    f"{self.method}: file not found after download (exit code {proc.returncode})"
+                    f"{self.method}: file not found after download"
                     if not file_path.exists()
-                    else f"{self.method}: file is empty (0 bytes, exit code {proc.returncode})"
+                    else f"{self.method}: file is empty (0 bytes)"
                 )
                 return self.result.to_dict()
 
-            # Post-download Defender check
             for _ in range(5):
                 time.sleep(2)
                 if not file_path.exists() or file_path.stat().st_size == 0:
@@ -592,9 +543,7 @@ class CLIDownloader:
                     )
                     return self.result.to_dict()
 
-            # For executables, try to run and check SmartScreen
             if save_path.endswith((".exe", ".msi")):
-                # Architecture guard — skip execution if PE arch doesn't match host
                 can_run, reason = is_runnable_on_host(save_path)
                 if not can_run:
                     self.result.outcome = DownloadOutcome.SUCCESS_EXECUTED
@@ -608,18 +557,15 @@ class CLIDownloader:
                             creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP,
                         )
                         time.sleep(6)
-
                         if not file_path.exists() or file_path.stat().st_size == 0:
                             self.result.outcome = DownloadOutcome.DEFENDER_BLOCKED
                             self.result.defender_message = "Defender removed/quarantined after execution"
                         else:
                             self.result.outcome = DownloadOutcome.SUCCESS_EXECUTED
-
                         try:
                             exec_proc.terminate()
                         except Exception:
                             pass
-
                     except Exception as e:
                         self.result.outcome = DownloadOutcome.SUCCESS_EXECUTED
                         self.result.error_details = f"Exec check: {e}"
@@ -635,3 +581,124 @@ class CLIDownloader:
             self.result.error_details = str(e)
 
         return self.result.to_dict()
+
+
+# ── FastAPI server ─────────────────────────────────────────────────────
+
+app = FastAPI(title="Download Sentinel — Worker Agent")
+app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOT_DIR)), name="screenshots")
+
+
+class RunRequest(BaseModel):
+    task_id: str
+    url: str
+    method: str
+
+
+class RestoreRequest(BaseModel):
+    snapshot_name: Optional[str] = None
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "agent": "worker_agent"}
+
+
+@app.post("/restore")
+def restore_snapshot(req: RestoreRequest = None):
+    return {"status": "ok", "message": "restore acknowledged"}
+
+
+import threading
+import requests as http_requests
+
+
+def _upload_screenshot(callback_url: str, task_id: str, ss_url: str):
+    """Download screenshot from agent and upload to backend."""
+    try:
+        img_resp = http_requests.get(
+            ss_url,
+            headers={"ngrok-skip-browser-warning": "true"},
+            timeout=15,
+        )
+        if img_resp.status_code == 200:
+            upload_resp = http_requests.post(
+                f"{callback_url}/api/tasks/{task_id}/screenshots/upload",
+                files={"file": ("screenshot.png", img_resp.content, "image/png")},
+                timeout=15,
+            )
+            if upload_resp.status_code == 200:
+                return upload_resp.json().get("url", ss_url)
+    except Exception as e:
+        print(f">>> Screenshot upload failed: {e}")
+    return ss_url
+
+
+def _process_tasks(run_id: str, tasks: list, callback_url: str):
+    browser_methods = {"edge", "chrome", "firefox"}
+    cli_methods = {"curl", "powershell"}
+
+    for task in tasks:
+        task_id = task.get("task_id")
+        url = task.get("url")
+        method = task.get("browser") or task.get("method")
+
+        print(f">>> Running task {task_id}: {method} -> {url}")
+
+        try:
+            if method in browser_methods:
+                runner = BrowserDownloader(method, task_id)
+            elif method in cli_methods:
+                runner = CLIDownloader(method, task_id)
+            else:
+                result = {"outcome": "failed", "error_details": f"Unknown method: {method}"}
+                _post_result(callback_url, run_id, task_id, result)
+                continue
+
+            result = runner.execute(url)
+        except Exception as e:
+            result = {"outcome": "failed", "error_details": str(e)}
+
+        print(f">>> Task {task_id} result: {result.get('outcome')}")
+        print(f">>> FULL RESULT: {result}")
+
+        # Upload screenshot to backend so frontend can display it
+        if result.get("screenshot_url"):
+            new_url = _upload_screenshot(callback_url, task_id, result["screenshot_url"])
+            result["screenshot_url"] = new_url
+
+        _post_result(callback_url, run_id, task_id, result)
+
+
+def _post_result(callback_url: str, run_id: str, task_id: str, result: dict):
+    try:
+        resp = http_requests.post(
+            f"{callback_url}/api/runs/{run_id}/tasks/{task_id}/result",
+            json=result,
+            timeout=30,
+        )
+        print(f">>> Callback {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f">>> Callback failed: {e}")
+
+
+@app.post("/run")
+async def run_task(request: Request):
+    body = await request.json()
+    print(">>> RECEIVED BODY:", body)
+
+    run_id = body.get("run_id")
+    callback_url = body.get("callback_url", "").rstrip("/")
+    tasks = body.get("tasks", [])
+
+    if not tasks:
+        return {"error": "No tasks provided"}
+
+    t = threading.Thread(target=_process_tasks, args=(run_id, tasks, callback_url), daemon=True)
+    t.start()
+
+    return {"status": "accepted", "task_count": len(tasks)}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=5000)
