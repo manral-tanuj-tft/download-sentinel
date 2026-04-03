@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -714,6 +714,16 @@ async def task_result_callback(
 
 
 # ── Screenshots ───────────────────────────────────────────────────────
+
+@app.post("/api/tasks/{task_id}/screenshots/upload")
+async def upload_screenshot_file(task_id: str, file: UploadFile = File(...)):
+    ss_dir = SCREENSHOT_DIR / task_id
+    ss_dir.mkdir(parents=True, exist_ok=True)
+    save_path = ss_dir / "screenshot.png"
+    with open(save_path, "wb") as f:
+        f.write(await file.read())
+    return {"url": f"/screenshots/{task_id}/screenshot.png"}
+
 
 @app.post("/api/tasks/{task_id}/screenshots")
 def add_screenshot(task_id: str, data: ScreenshotAdd, db: Session = Depends(get_db)):
