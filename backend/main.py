@@ -719,10 +719,10 @@ async def task_result_callback(
 async def upload_screenshot_file(task_id: str, file: UploadFile = File(...)):
     ss_dir = SCREENSHOT_DIR / task_id
     ss_dir.mkdir(parents=True, exist_ok=True)
-    save_path = ss_dir / "screenshot.png"
+    save_path = ss_dir / file.filename
     with open(save_path, "wb") as f:
         f.write(await file.read())
-    return {"url": f"/screenshots/{task_id}/screenshot.png"}
+    return {"url": f"/screenshots/{task_id}/{file.filename}"}
 
 
 @app.post("/api/tasks/{task_id}/screenshots")

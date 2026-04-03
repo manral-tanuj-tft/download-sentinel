@@ -662,10 +662,20 @@ def _process_tasks(run_id: str, tasks: list, callback_url: str):
         print(f">>> Task {task_id} result: {result.get('outcome')}")
         print(f">>> FULL RESULT: {result}")
 
-        # Upload screenshot to backend so frontend can display it
-        if result.get("screenshot_url"):
-            new_url = _upload_screenshot(callback_url, task_id, result["screenshot_url"])
-            result["screenshot_url"] = new_url
+        # Upload ALL screenshots from task folder to backend
+        task_ss_dir = SCREENSHOT_DIR / task_id
+        if task_ss_dir.exists():
+            for ss_file in sorted(task_ss_dir.glob("*.png")):
+                try:
+                    with open(ss_file, "rb") as f:
+                        upload_resp = http_requests.post(
+                            f"{callback_url}/api/tasks/{task_id}/screenshots/upload",
+                            files={"file": (ss_file.name, f, "image/png")},
+                            timeout=15,
+                        )
+                        print(f">>> Uploaded {ss_file.name}: {upload_resp.status_code}")
+                except Exception as e:
+                    print(f">>> Upload failed {ss_file.name}: {e}")
 
         _post_result(callback_url, run_id, task_id, result)
 
